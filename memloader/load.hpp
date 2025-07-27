@@ -1,118 +1,113 @@
-#pragma once
 #include <windows.h>
+#include <iostream>
+
+#define RVA_TO_VA(base, rva) ((BYTE*)(base) + (rva))
 
 extern unsigned char EXEbytes[];
 extern size_t EXEbytesSize;
 
-#define RVA_TO_VA(base, rva) ((BYTE*)(base) + (rva))
-
 void loadbytes()
 {
-    BYTE* exeData = EXEbytes;
-
-    PIMAGE_DOS_HEADER dosHeader = (PIMAGE_DOS_HEADER)exeData;
-    if (dosHeader->e_magic != IMAGE_DOS_SIGNATURE) return;
-
-    PIMAGE_NT_HEADERS ntHeaders = (PIMAGE_NT_HEADERS)(exeData + dosHeader->e_lfanew);
-    if (ntHeaders->Signature != IMAGE_NT_SIGNATURE) return;
-
-    SIZE_T imageSize = ntHeaders->OptionalHeader.SizeOfImage;
-
-    BYTE* imageBase = (BYTE*)VirtualAlloc((LPVOID)(ntHeaders->OptionalHeader.ImageBase), imageSize, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
-    if (!imageBase)
+    __try
     {
-        imageBase = (BYTE*)VirtualAlloc(NULL, imageSize, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
-        if (!imageBase) return;
-    }
+        BYTE* exeData = EXEbytes;
+        PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)exeData;
+        if (dos->e_magic != IMAGE_DOS_SIGNATURE) return;
 
-    memcpy(imageBase, exeData, ntHeaders->OptionalHeader.SizeOfHeaders);
+        PIMAGE_NT_HEADERS nt = (PIMAGE_NT_HEADERS)(exeData + dos->e_lfanew);
+        if (nt->Signature != IMAGE_NT_SIGNATURE) return;
 
-    PIMAGE_SECTION_HEADER section = IMAGE_FIRST_SECTION(ntHeaders);
-    for (int i = 0; i < ntHeaders->FileHeader.NumberOfSections; i++, section++)
-    {
-        if (section->SizeOfRawData > 0)
+        SIZE_T size = nt->OptionalHeader.SizeOfImage;
+        BYTE* mem = (BYTE*)VirtualAlloc(NULL, size, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+        if (!mem) return;
+
+        memcpy(mem, exeData, nt->OptionalHeader.SizeOfHeaders);
+
+        PIMAGE_SECTION_HEADER sec = IMAGE_FIRST_SECTION(nt);
+        for (int i = 0; i < nt->FileHeader.NumberOfSections; i++, sec++)
         {
-            memcpy(imageBase + section->VirtualAddress, exeData + section->PointerToRawData, section->SizeOfRawData);
-        }
-    }
-
-    ULONG_PTR delta = (ULONG_PTR)(imageBase - ntHeaders->OptionalHeader.ImageBase);
-    if (delta != 0 && ntHeaders->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].Size > 0)
-    {
-        PIMAGE_BASE_RELOCATION reloc = (PIMAGE_BASE_RELOCATION)(imageBase + ntHeaders->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].VirtualAddress);
-        ULONG relocSize = ntHeaders->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].Size;
-        ULONG processed = 0;
-
-        while (processed < relocSize)
-        {
-            DWORD count = (reloc->SizeOfBlock - sizeof(IMAGE_BASE_RELOCATION)) / sizeof(WORD);
-            WORD* list = (WORD*)((BYTE*)reloc + sizeof(IMAGE_BASE_RELOCATION));
-            for (DWORD i = 0; i < count; i++)
+            if (sec->SizeOfRawData)
             {
-                WORD type_offset = list[i];
-                WORD type = type_offset >> 12;
-                WORD offset = type_offset & 0xfff;
-
-                if (type == IMAGE_REL_BASED_HIGHLOW)
-                {
-                    DWORD* patchAddr = (DWORD*)(imageBase + reloc->VirtualAddress + offset);
-                    *patchAddr += (DWORD)delta;
-                }
-                else if (type == IMAGE_REL_BASED_DIR64)
-                {
-                    ULONG_PTR* patchAddr = (ULONG_PTR*)(imageBase + reloc->VirtualAddress + offset);
-                    *patchAddr += (ULONG_PTR)delta;
-                }
+                memcpy(mem + sec->VirtualAddress, exeData + sec->PointerToRawData, sec->SizeOfRawData);
             }
-            processed += reloc->SizeOfBlock;
-            reloc = (PIMAGE_BASE_RELOCATION)((BYTE*)reloc + reloc->SizeOfBlock);
         }
-    }
 
-    if (ntHeaders->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].Size > 0)
-    {
-        PIMAGE_IMPORT_DESCRIPTOR importDesc = (PIMAGE_IMPORT_DESCRIPTOR)(imageBase + ntHeaders->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress);
-        while (importDesc->Name)
+        ULONG_PTR delta = (ULONG_PTR)(mem - nt->OptionalHeader.ImageBase);
+        if (delta && nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].Size)
         {
-            char* moduleName = (char*)(imageBase + importDesc->Name);
-            HMODULE module = LoadLibraryA(moduleName);
-            if (!module) return;
-
-            PIMAGE_THUNK_DATA thunkILT = (PIMAGE_THUNK_DATA)(imageBase + importDesc->OriginalFirstThunk);
-            PIMAGE_THUNK_DATA thunkIAT = (PIMAGE_THUNK_DATA)(imageBase + importDesc->FirstThunk);
-
-            while (thunkILT->u1.AddressOfData)
+            PIMAGE_BASE_RELOCATION reloc = (PIMAGE_BASE_RELOCATION)(mem +
+                nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].VirtualAddress);
+            SIZE_T processed = 0;
+            while (processed < nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].Size)
             {
-                FARPROC procAddress = NULL;
-                if (thunkILT->u1.Ordinal & IMAGE_ORDINAL_FLAG)
+                DWORD count = (reloc->SizeOfBlock - sizeof(IMAGE_BASE_RELOCATION)) / sizeof(WORD);
+                WORD* list = (WORD*)((BYTE*)reloc + sizeof(IMAGE_BASE_RELOCATION));
+                for (DWORD i = 0; i < count; i++)
                 {
-                    procAddress = GetProcAddress(module, (LPCSTR)(thunkILT->u1.Ordinal & 0xffff));
-                }
-                else
-                {
-                    PIMAGE_IMPORT_BY_NAME importByName = (PIMAGE_IMPORT_BY_NAME)(imageBase + thunkILT->u1.AddressOfData);
-                    procAddress = GetProcAddress(module, importByName->Name);
-                }
-                if (!procAddress) return;
+                    WORD type_offset = list[i];
+                    WORD type = type_offset >> 12;
+                    WORD offset = type_offset & 0xFFF;
+                    BYTE* addr = mem + reloc->VirtualAddress + offset;
 
-                thunkIAT->u1.Function = (ULONG_PTR)procAddress;
-
-                thunkILT++;
-                thunkIAT++;
+                    if (type == IMAGE_REL_BASED_HIGHLOW)
+                        *(DWORD*)addr += (DWORD)delta;
+                    else if (type == IMAGE_REL_BASED_DIR64)
+                        *(ULONGLONG*)addr += delta;
+                }
+                processed += reloc->SizeOfBlock;
+                reloc = (PIMAGE_BASE_RELOCATION)((BYTE*)reloc + reloc->SizeOfBlock);
             }
-            importDesc++;
         }
+
+        if (nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].Size)
+        {
+            PIMAGE_IMPORT_DESCRIPTOR imp = (PIMAGE_IMPORT_DESCRIPTOR)(mem +
+                nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress);
+            while (imp->Name)
+            {
+                char* modName = (char*)(mem + imp->Name);
+                HMODULE lib = LoadLibraryA(modName);
+                if (!lib) return;
+
+                PIMAGE_THUNK_DATA thunk = (PIMAGE_THUNK_DATA)(mem + imp->FirstThunk);
+                PIMAGE_THUNK_DATA orig = imp->OriginalFirstThunk ?
+                    (PIMAGE_THUNK_DATA)(mem + imp->OriginalFirstThunk) : thunk;
+
+                while (orig->u1.AddressOfData)
+                {
+                    FARPROC proc = nullptr;
+                    if (orig->u1.Ordinal & IMAGE_ORDINAL_FLAG)
+                    {
+                        proc = GetProcAddress(lib, (LPCSTR)(orig->u1.Ordinal & 0xFFFF));
+                    }
+                    else
+                    {
+                        PIMAGE_IMPORT_BY_NAME name = (PIMAGE_IMPORT_BY_NAME)(mem + orig->u1.AddressOfData);
+                        proc = GetProcAddress(lib, name->Name);
+                    }
+
+                    if (!proc) return;
+                    thunk->u1.Function = (ULONGLONG)proc;
+
+                    ++thunk;
+                    ++orig;
+                }
+
+                ++imp;
+            }
+        }
+
+        FlushInstructionCache(GetCurrentProcess(), mem, size);
+
+        DWORD epRVA = nt->OptionalHeader.AddressOfEntryPoint;
+        void (*entry)() = (void(*)())(mem + epRVA);
+        entry();
+
+        VirtualFree(mem, 0, MEM_RELEASE);
     }
-
-    FlushInstructionCache(GetCurrentProcess(), imageBase, imageSize);
-
-    DWORD entryRVA = ntHeaders->OptionalHeader.AddressOfEntryPoint;
-    LPTHREAD_START_ROUTINE entryPoint = (LPTHREAD_START_ROUTINE)(imageBase + entryRVA);
-
-    HANDLE thread = CreateThread(NULL, 0, entryPoint, NULL, 0, NULL);
-    if (!thread) return;
-
-    WaitForSingleObject(thread, INFINITE);
-
-    VirtualFree(imageBase, 0, MEM_RELEASE);
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        DWORD code = GetExceptionCode();
+        std::cout << "[!] SEH Exception code: 0x" << std::hex << code << std::dec << std::endl;
+    }
 }
